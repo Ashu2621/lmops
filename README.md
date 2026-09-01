@@ -63,6 +63,75 @@ target.
 
 ---
 
+## Results
+
+Reference model: **3.48M parameters**, 4 layers, `d_model` 256, 192-token context,
+1024-token byte-level BPE vocabulary. Trained on public-domain Shakespeare for 1200
+steps — **≈39 minutes on a laptop CPU, no GPU**. Full detail and reproduction commands:
+[`docs/benchmarks.md`](docs/benchmarks.md).
+
+| | |
+| --- | ---: |
+| validation loss | **3.2360** |
+| validation perplexity | **25.43** |
+| bits per byte | **2.0944** |
+| top-1 next-token accuracy | **33.45%** |
+| training throughput | 1,739 tokens/sec (median) |
+| tokenizer compression | 2.40 characters/token |
+
+Validation loss improved monotonically at all eight evaluations, so the run was still
+learning when it stopped rather than overfitting.
+
+<details>
+<summary><b>Sample output</b> (seed 7, temperature 0.8, top-p 0.95)</summary>
+
+```
+KING RICHARD:
+Even so favour! thou art not a cords;
+Not dost thou wilt not a parade meaning to me.
+
+NORFOLK:
+O, then thy name is banished! Thou hast subjectd!
+
+JULIET:
+Three day thou wouldst be talk'd in thee?
+
+ROMEO:
+'Tis that thy love is dead, that thy daughter's dead.
+
+LADY CAPULET:
+I should bend your grace as I speak.
+```
+
+Speaker headings, verse line breaks and Early Modern English morphology, all learned
+from 0.4M tokens. Coherence beyond a clause, no — see the
+[model card](docs/model_card.md#limitations).
+</details>
+
+### Export parity
+
+Both graphs are traced at one shape and then verified at a **different** one:
+
+| format | size | max deviation from eager | tolerance | verdict |
+| --- | ---: | ---: | ---: | --- |
+| TorchScript | 13.9 MB | `0.000e+00` | 1e-4 | PASS |
+| ONNX (opset 17) | 15.1 MB | `1.907e-05` | 1e-3 | PASS |
+
+### The KV cache, measured rather than asserted
+
+| workload | cached per-token | uncached per-token | end-to-end speedup |
+| --- | ---: | ---: | ---: |
+| 32 prompt + 64 new | 7.55 ms | 13.30 ms | **1.75×** |
+| 128 prompt + 64 new | 7.18 ms | 20.02 ms | **2.77×** |
+| 32 prompt + 64 new, batch 4 | 7.24 ms | 24.15 ms | **3.25×** |
+
+Cached per-token latency is **flat in context length** (7.55 ms → 7.18 ms) while
+uncached latency grows with it (13.30 ms → 20.02 ms). The cache is also marginally
+*slower* to first token, because prefill does the same work either way plus the cache
+writes — a single "N× faster" headline would hide both facts.
+
+---
+
 ## Architecture
 
 ```
@@ -147,7 +216,8 @@ def test_kv_cache_matches_full_forward(tiny_model):
 
 ## Testing
 
-Correctness properties, not coverage theatre. A selection of what is actually asserted:
+**139 tests.** Correctness properties, not coverage theatre. A selection of what is
+actually asserted:
 
 | Test | What breaks without it |
 | --- | --- |
