@@ -1,0 +1,32 @@
+# Smoke configuration: small enough that CI can run a real training loop end to end
+# in well under a minute. Not meant to produce a usable model -- it exists so that a
+# broken loop fails in CI rather than three hours into a real run.
+model:
+  vocab_size: 1024
+  n_layer: 2
+  n_head: 4
+  n_kv_head: 2
+  d_model: 128
+  max_seq_len: 128
+  dropout: 0.0
+
+data:
+  data_dir: data/processed
+  tokenizer_path: data/processed/tokenizer.json
+  batch_size: 8
+  seq_len: 128
+
+optim:
+  lr: 0.001
+  warmup_steps: 5
+  weight_decay: 0.1
+  grad_clip: 1.0
+
+train:
+  max_steps: 20
+  eval_interval: 10
+  eval_batches: 2
+  log_interval: 5
+  checkpoint_interval: 20
+  seed: 1337
+  out_dir: runs/tiny

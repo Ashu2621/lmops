@@ -1,0 +1,40 @@
+# Grouped-query attention ablation. Identical to small.yaml in every respect except
+# n_kv_head, so the difference in validation loss is attributable to GQA alone.
+# Eight query heads share two key/value heads, cutting KV-cache memory 4x.
+model:
+  vocab_size: 1024
+  n_layer: 4
+  n_head: 8
+  n_kv_head: 2          # 4 query heads per kv head
+  d_model: 256
+  max_seq_len: 192
+  dropout: 0.1
+  rope_theta: 10000.0
+  tie_embeddings: true
+
+data:
+  data_dir: data/processed
+  tokenizer_path: data/processed/tokenizer.json
+  batch_size: 16
+  seq_len: 192
+
+optim:
+  lr: 0.0008
+  min_lr_ratio: 0.1
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  warmup_steps: 100
+
+train:
+  max_steps: 1200
+  grad_accum_steps: 1
+  eval_interval: 150
+  eval_batches: 20
+  log_interval: 25
+  checkpoint_interval: 500
+  seed: 1337
+  device: auto
+  dtype: auto
+  out_dir: runs/small-gqa
