@@ -170,9 +170,14 @@ def export_cmd(
         failures += not result.passed
 
     if fmt in ("onnx", "all"):
+        from .export import graph as _graph
+
         path = export_onnx(model, out_dir / "model.onnx", seq_len=seq_len, opset=opset)
         result = verify_onnx(model, path)
-        typer.echo(f"{path}\n  {result.render()}")
+        # Name the exporter that ran: torch changes its ONNX default between releases,
+        # so a log that omits it makes a future regression much harder to place.
+        typer.echo(f"{path} (exporter: {_graph.last_used_onnx_exporter})")
+        typer.echo(f"  {result.render()}")
         failures += not result.passed
 
     if failures:

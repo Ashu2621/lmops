@@ -32,6 +32,9 @@ serve = [
     "prometheus-client>=0.20",
 ]
 export = [
+    # The dynamo ONNX exporter needs onnxscript; export_onnx falls back to it when the
+    # deprecated TorchScript exporter is unavailable. See src/lmops/export/graph.py.
+    "onnxscript>=0.1",
     "onnx>=1.16",
     "onnxruntime>=1.18",
 ]

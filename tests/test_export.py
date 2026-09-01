@@ -98,3 +98,15 @@ def test_quantised_predictions_stay_close_to_full_precision(
         quantized = quantize_dynamic_int8(tiny_model)(ids)[0].argmax(-1)
     agreement = (reference == quantized).float().mean().item()
     assert agreement > 0.5, f"top-1 agreement collapsed to {agreement:.2%}"
+
+
+def test_export_records_which_onnx_exporter_ran(tiny_model: LanguageModel, tmp_path: Path) -> None:
+    """PyTorch ships two ONNX exporters and changes which one is the default between
+    releases, so ``export_onnx`` tries them in order. Recording the winner keeps that
+    from being invisible: a CI log that says which exporter produced the artifact is
+    the difference between a five-minute and a five-hour debug session."""
+    from lmops.export import graph
+
+    graph.last_used_onnx_exporter = None
+    export_onnx(tiny_model, tmp_path / "m.onnx", seq_len=16)
+    assert graph.last_used_onnx_exporter in {"torchscript", "dynamo", "torchscript (implicit)"}

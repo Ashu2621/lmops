@@ -15,6 +15,7 @@ produces a perfectly valid ``.onnx`` file.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,6 +56,10 @@ class ParityResult:
             f"[{verdict}] {self.backend}: max |eager - exported| = "
             f"{self.max_abs_diff:.3e} (tolerance {self.tolerance:.1e})"
         )
+
+
+last_used_onnx_exporter: str | None = None
+"""Which ONNX exporter produced the most recent export. Set by :func:`export_onnx`."""
 
 
 def _example_input(model: LanguageModel, batch_size: int, seq_len: int, seed: int = 0) -> Tensor:
@@ -116,27 +121,65 @@ def export_onnx(
     seq_len: int = 32,
     opset: int = 17,
 ) -> Path:
-    """Export the scoring graph to ONNX with dynamic batch and sequence axes."""
+    """Export the scoring graph to ONNX with dynamic batch and sequence axes.
+
+    PyTorch ships two ONNX exporters and the *default* changed between releases, so
+    leaving the choice implicit makes the export silently depend on which torch happens
+    to be installed. Neither one works everywhere:
+
+    * The TorchScript exporter (``dynamo=False``) handles this graph cleanly and matches
+      eager output to ~4e-07 on torch 2.8, but is deprecated and eventually removed.
+    * The dynamo exporter (``dynamo=True``) is the future, needs ``onnxscript``, and on
+      torch 2.8 fails to decompose this graph with a ``ConversionError``.
+
+    So the exporters are tried in order and the first that succeeds wins. This is safe
+    precisely because :func:`verify_onnx` re-checks the result numerically against the
+    eager model afterwards -- whichever path produced the file still has to prove it is
+    correct. ``last_used_onnx_exporter`` records which one ran.
+
+    The ``dynamo`` keyword only exists on torch >= 2.6; on older versions the legacy
+    exporter is the only one and is selected by omission.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     model.eval()
     wrapper = LogitsOnly(model).eval()
     example = _example_input(model, batch_size, seq_len)
 
-    torch.onnx.export(
-        wrapper,
-        (example,),
-        str(path),
-        input_names=["input_ids"],
-        output_names=["logits"],
-        dynamic_axes={
+    kwargs: dict = {
+        "input_names": ["input_ids"],
+        "output_names": ["logits"],
+        "dynamic_axes": {
             "input_ids": {0: "batch", 1: "sequence"},
             "logits": {0: "batch", 1: "sequence"},
         },
-        opset_version=opset,
-        do_constant_folding=True,
-    )
-    return path
+        "opset_version": opset,
+        "do_constant_folding": True,
+    }
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        attempts: list[dict] = [{"dynamo": False}, {"dynamo": True}]
+    else:
+        attempts = [{}]
+
+    global last_used_onnx_exporter
+    errors: list[str] = []
+    for extra in attempts:
+        try:
+            torch.onnx.export(wrapper, (example,), str(path), **kwargs, **extra)
+        except Exception as exc:
+            errors.append(f"{_exporter_name(extra)}: {type(exc).__name__}: {exc}")
+            continue
+        last_used_onnx_exporter = _exporter_name(extra)
+        return path
+
+    detail = "; ".join(errors)
+    raise RuntimeError(f"every available ONNX exporter failed -- {detail}")
+
+
+def _exporter_name(extra: dict) -> str:
+    if "dynamo" not in extra:
+        return "torchscript (implicit)"
+    return "dynamo" if extra["dynamo"] else "torchscript"
 
 
 def verify_onnx(
