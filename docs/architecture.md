@@ -41,7 +41,7 @@ A decoder-only transformer, ~3.5M parameters in the reference config.
 | **RMSNorm** | Same stabilising effect as LayerNorm without the mean subtraction, so one fewer reduction per call. Computed in float32 even under autocast — `rsqrt` of a half-precision mean-square is a well-known source of blow-ups. |
 | **RoPE** | Relative position encoded by rotating queries and keys, so attention scores depend only on *distance*. No learned position table to bound or extrapolate, and the cache resumes at an offset for free. |
 | **SwiGLU feed-forward** | Consistently beats ReLU/GELU MLPs at equal parameter count. Inner width is `8/3 · d_model` rounded up, the usual rule for matching a plain MLP's parameter count given three projections instead of two. |
-| **Grouped-query attention** | `n_kv_head < n_head` shrinks the KV cache linearly, which is the memory that actually bounds concurrent sequences at serving time. Set `n_kv_head == n_head` for plain MHA. See the measured ablation in [benchmarks.md](benchmarks.md). |
+| **Grouped-query attention** | `n_kv_head < n_head` shrinks the KV cache linearly, which is the memory that actually bounds concurrent sequences at serving time. Set `n_kv_head == n_head` for plain MHA. `configs/small-gqa.yaml` is a ready-made ablation -- identical to the reference config except for `n_kv_head` -- so the quality cost is measurable with one command. |
 | **Tied embeddings** | Removes `vocab_size × d_model` parameters and usually helps at small scale, where the embedding table is a large fraction of the model. |
 | **Scaled residual init** | Output projections are initialised at `init_std / sqrt(2·n_layer)`, so residual-stream variance does not grow linearly with depth. |
 

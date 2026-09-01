@@ -43,7 +43,7 @@ Design rationale for each choice: [`architecture.md`](architecture.md).
 **In scope.** Demonstrating and testing an end-to-end language-model pipeline —
 tokenizer training, model training, evaluation, graph export, and low-latency serving.
 It is a reference implementation and a test fixture. It is also a reasonable starting
-point for anyone who wants to understand a modern decoder stack by reading ~1,500
+point for anyone who wants to understand a modern decoder stack by reading ~1,400
 lines rather than a framework.
 
 **Out of scope.** This model must not be used for anything that matters. It is far too
