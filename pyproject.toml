@@ -1,0 +1,122 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lmops"
+version = "0.1.0"
+description = "Train, evaluate, export, serve and observe a decoder-only language model built from scratch in PyTorch."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Ashutosh" }]
+keywords = ["pytorch", "transformer", "llm", "mlops", "inference", "serving"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+serve = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    "prometheus-client>=0.20",
+]
+export = [
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "httpx>=0.27",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+lmops = "lmops.cli:app"
+
+[project.urls]
+Repository = "https://github.com/Ashu2621/lmops"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lmops = ["py.typed"]
+
+# ----------------------------------------------------------------------------
+# Tooling
+# ----------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",    # line length is handled by the formatter
+    "B008",    # function call in default arg (typer idiom)
+    "RUF012",  # mutable class attrs need ClassVar (noisy with torch modules)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B017"]
+
+[tool.mypy]
+files = ["src/lmops"]
+strict = false
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["lmops.cli"]
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: marks tests that take more than a few seconds",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["src/lmops"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

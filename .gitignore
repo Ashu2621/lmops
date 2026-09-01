@@ -1,0 +1,38 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Derived data: rebuild with `lmops prepare`
+data/processed/
+
+# Training outputs and exported artifacts: rebuild with `lmops train` / `lmops export`
+runs/
+artifacts/
+*.pt
+*.onnx
+*.bin
+!data/raw/*.txt
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

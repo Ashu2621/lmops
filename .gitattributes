@@ -1,0 +1,13 @@
+# Normalise line endings so the repo is identical on Windows, Linux and macOS.
+* text=auto eol=lf
+
+# Shell scripts and Makefiles break with CRLF.
+*.sh text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+
+# Binary artifacts must never be normalised.
+*.bin binary
+*.pt binary
+*.onnx binary
+*.png binary
