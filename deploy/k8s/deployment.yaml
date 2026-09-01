@@ -1,0 +1,125 @@
+# Reference deployment for the lmops inference API.
+#
+# The probe split is the part that matters. `/healthz` never touches the model, so a
+# saturated pod is not restarted mid-request; `/readyz` reports whether a checkpoint
+# is loaded, so a pod that came up without one is pulled out of the Service instead of
+# serving 503s to users. Wiring both to the same endpoint is a common and expensive
+# mistake -- under load the liveness probe times out and Kubernetes restarts exactly
+# the pods that were doing the most work.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lmops-api
+  labels:
+    app.kubernetes.io/name: lmops
+    app.kubernetes.io/component: inference
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lmops
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lmops
+        app.kubernetes.io/component: inference
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8000"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: lmops:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: LMOPS_CHECKPOINT
+              value: /models/best.pt
+            - name: LMOPS_TOKENIZER
+              value: /models/tokenizer.json
+            - name: LMOPS_DEVICE
+              value: cpu
+            - name: LMOPS_MAX_CONCURRENCY
+              value: "4"
+            # Keep torch's thread pool inside the CPU limit. Left unset, torch sizes
+            # it from the node's core count and thrashes against the cgroup quota.
+            - name: OMP_NUM_THREADS
+              value: "4"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 2Gi
+          startupProbe:
+            # Loading a checkpoint is slow but bounded; give it 60s before the
+            # liveness probe starts counting failures.
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: lmops-models
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lmops-api
+  labels:
+    app.kubernetes.io/name: lmops
+spec:
+  selector:
+    app.kubernetes.io/name: lmops
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lmops-models
+spec:
+  accessModes: ["ReadOnlyMany"]
+  resources:
+    requests:
+      storage: 1Gi

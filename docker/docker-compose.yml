@@ -1,0 +1,48 @@
+# Local serving stack: the API plus a Prometheus that scrapes it.
+#
+# Mount a directory containing `best.pt` and `tokenizer.json` at /models. After
+# `make prepare && make train` that directory is `runs/small` plus the tokenizer
+# from `data/processed`; the default below assumes you have copied both into
+# ./models at the repository root.
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: lmops:latest
+    container_name: lmops-api
+    ports:
+      - "8000:8000"
+    environment:
+      LMOPS_CHECKPOINT: /models/best.pt
+      LMOPS_TOKENIZER: /models/tokenizer.json
+      LMOPS_DEVICE: cpu
+      LMOPS_MAX_CONCURRENCY: "4"
+      LMOPS_QUEUE_TIMEOUT_S: "10"
+      OMP_NUM_THREADS: "4"
+    volumes:
+      - ../models:/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 2G
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: lmops-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    depends_on:
+      - api

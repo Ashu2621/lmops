@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # Runners are shared and small; letting torch spawn a thread per core makes the
+  # test suite slower, not faster.
+  OMP_NUM_THREADS: "2"
+
+jobs:
+  quality:
+    name: lint + types + tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU wheel only: the default index pulls several GB of unused CUDA libs.
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
+          pip install -e ".[dev,serve,export]"
+
+      - name: Lint
+        run: |
+          ruff check --output-format=github .
+          ruff format --check .
+
+      - name: Type check
+        run: mypy
+
+      - name: Tests
+        run: pytest --cov=lmops --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: error
+
+  pipeline:
+    name: end-to-end pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
+          pip install -e ".[dev,serve,export]"
+
+      # Every stage below runs against artifacts produced by the stage before it.
+      # A unit test can pass while the pipeline is wired together wrongly; this job
+      # is what catches that.
+      - name: Prepare a corpus
+        run: |
+          lmops prepare \
+            --input data/raw/tinyshakespeare.txt \
+            --out data/processed \
+            --vocab-size 512 \
+            --tokenizer-chars 100000
+
+      - name: Train (smoke config)
+        run: lmops train --config configs/tiny.yaml --out-dir runs/ci
+
+      - name: Evaluate
+        run: lmops eval --checkpoint runs/ci/best.pt --data data/processed --max-batches 5 --report runs/ci/eval.json
+
+      - name: Sample
+        run: lmops sample --checkpoint runs/ci/best.pt --tokenizer data/processed/tokenizer.json --prompt "KING" --tokens 32 --seed 0
+
+      - name: Export and verify parity
+        run: lmops export --checkpoint runs/ci/best.pt --out artifacts --seq-len 32
+
+      - name: Benchmark
+        run: lmops bench --checkpoint runs/ci/best.pt --generated-tokens 16 --runs 1 --report runs/ci/bench.json
+
+      - name: Resume from a checkpoint
+        run: lmops train --config configs/tiny.yaml --out-dir runs/ci-resume --resume runs/ci/last.pt --max-steps 25
+
+      - name: Serve and probe the API
+        run: |
+          lmops serve \
+            --checkpoint runs/ci/best.pt \
+            --tokenizer data/processed/tokenizer.json \
+            --host 127.0.0.1 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/healthz >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/healthz
+          curl -fsS http://127.0.0.1:8000/readyz
+          curl -fsS -X POST http://127.0.0.1:8000/v1/generate \
+            -H 'content-type: application/json' \
+            -d '{"prompt":"KING","max_new_tokens":16,"seed":1}'
+          curl -fsS http://127.0.0.1:8000/metrics | grep -q lmops_requests_total
+          # A request the model cannot satisfy must be a 422, not a 500.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/v1/generate \
+            -H 'content-type: application/json' -d '{"prompt":"","max_new_tokens":4}')" = "422"
+
+      - name: Upload pipeline artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-outputs
+          path: |
+            runs/ci/eval.json
+            runs/ci/bench.json
+            runs/ci/metrics.jsonl
+          if-no-files-found: warn
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the serving image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: lmops:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image must start and answer liveness without a model mounted
+        run: |
+          docker run -d --name lmops-ci -p 8000:8000 lmops:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/healthz >/dev/null && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/healthz
+          # No checkpoint is mounted, so readiness must report 503 rather than crash.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/readyz)" = "503"
+          docker logs lmops-ci
+          docker rm -f lmops-ci

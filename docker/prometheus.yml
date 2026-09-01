@@ -1,0 +1,15 @@
+# Scrapes the lmops API's /metrics endpoint.
+#
+# A 5s interval is aggressive for production but useful locally: generation latency
+# histograms are only interesting once there are enough samples to populate the tail.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: lmops-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          service: lmops
