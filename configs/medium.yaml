@@ -1,6 +1,9 @@
 # Larger configuration for a GPU: ~11M parameters, 256-token context.
-# Not exercised by CI and not the source of the reported numbers -- on a laptop CPU
-# this trains at roughly 800 tokens/sec, which is about four hours for 2000 steps.
+#
+# Not exercised by CI and not the source of any reported number. Measured on the
+# laptop CPU used for the reference run it trains at roughly 800 tokens/sec, which is
+# about four hours for 2000 steps -- hence configs/small.yaml being the baseline.
+model:
   vocab_size: 1024
   n_layer: 6
   n_head: 6

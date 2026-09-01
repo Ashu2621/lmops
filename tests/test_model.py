@@ -263,3 +263,22 @@ def test_stream_restores_training_mode(tiny_model: LanguageModel) -> None:
     prompt = torch.randint(0, tiny_model.config.vocab_size, (1, 3))
     list(tiny_model.stream(prompt, max_new_tokens=2, temperature=0.0))
     assert tiny_model.training is True
+
+
+def test_decoding_does_not_run_a_wasted_final_forward(tiny_model: LanguageModel) -> None:
+    """Generating N tokens costs one prefill plus N-1 incremental forward passes.
+
+    The token yielded last needs no follow-up pass: its logits would be read by a step
+    that never happens. Getting this wrong is invisible in output and costs a full
+    forward pass on every single request.
+    """
+    calls: list[int] = []
+    handle = tiny_model.token_emb.register_forward_hook(lambda *_: calls.append(1))
+    prompt = torch.randint(0, tiny_model.config.vocab_size, (1, 4))
+    try:
+        tokens = list(tiny_model.stream(prompt, max_new_tokens=5, temperature=0.0))
+    finally:
+        handle.remove()
+
+    assert len(tokens) == 5
+    assert len(calls) == 5, f"expected 1 prefill + 4 decode passes, got {len(calls)}"

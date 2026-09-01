@@ -204,7 +204,7 @@ class LanguageModel(nn.Module):
             generated = idx
             finished = torch.zeros(batch, dtype=torch.bool, device=device)
 
-            for _ in range(max_new_tokens):
+            for step in range(max_new_tokens):
                 next_token = _sample(
                     logits[:, -1, :],
                     temperature=temperature,
@@ -228,6 +228,11 @@ class LanguageModel(nn.Module):
                 yield next_token
 
                 if eos_token_id is not None and bool(finished.all()):
+                    break
+                if step + 1 == max_new_tokens:
+                    # The token just yielded was the last one asked for. Running the
+                    # model again would produce logits nobody reads -- a full wasted
+                    # forward pass on every request.
                     break
                 logits, _ = self(next_token, cache=cache, last_only=True)
         finally:
