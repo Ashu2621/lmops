@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -206,7 +206,7 @@ class GenerationEngine:
         finally:
             self._slots.release()
 
-    def stream(self, request: GenerateRequest) -> Iterator[dict]:
+    def stream(self, request: GenerateRequest) -> Generator[dict, None, None]:
         """Yield ``{"delta": ...}`` events, then a final ``{"done": true, ...}`` event."""
         self._acquire()
         try:

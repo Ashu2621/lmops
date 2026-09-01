@@ -237,3 +237,46 @@ def test_openapi_schema_is_served(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     assert "/v1/generate" in schema["paths"]
     assert "/v1/generate/stream" in schema["paths"]
+
+
+def test_streaming_returns_503_when_saturated(client: TestClient, engine: GenerationEngine) -> None:
+    """A rejected stream must be a 503, not a 200 whose body happens to contain an error.
+
+    ``engine.stream`` is a generator function, so admission control does not run until
+    the first event is pulled. The route primes the generator before returning the
+    response precisely so this status code is still changeable.
+    """
+    engine.queue_timeout_s = 0.05
+    engine._slots.acquire()
+    engine._slots.acquire()
+    try:
+        response = client.post("/v1/generate/stream", json={"prompt": "hi", "max_new_tokens": 4})
+        assert response.status_code == 503
+        assert "busy" in response.json()["detail"]
+    finally:
+        engine._slots.release()
+        engine._slots.release()
+
+
+def test_streaming_returns_422_for_an_impossible_budget(client: TestClient) -> None:
+    response = client.post("/v1/generate/stream", json={"prompt": "hi", "max_new_tokens": 1024})
+    assert response.status_code == 422
+    assert "no room" in response.json()["detail"]
+
+
+def test_streaming_releases_its_slot(client: TestClient, engine: GenerationEngine) -> None:
+    """After a completed stream every concurrency slot must be back in the pool."""
+    for _ in range(3):
+        with client.stream(
+            "POST", "/v1/generate/stream", json={"prompt": "The", "max_new_tokens": 4}
+        ) as response:
+            assert response.status_code == 200
+            response.read()
+
+    acquired = [engine._slots.acquire(blocking=False) for _ in range(engine.max_concurrency)]
+    try:
+        assert all(acquired), "a streaming request leaked a concurrency slot"
+    finally:
+        for ok in acquired:
+            if ok:
+                engine._slots.release()

@@ -174,39 +174,66 @@ def create_app() -> FastAPI:
 async def _stream_response(request: GenerateRequest, engine: GenerationEngine) -> Response:
     """Wrap the engine's blocking generator in an SSE response.
 
-    ``iterate_in_threadpool`` is what keeps the blocking torch loop off the event loop;
-    without it a single long generation stalls every other connection, health probes
-    included.
+    The generator is **primed** before the response is returned. ``engine.stream`` is a
+    generator function, so merely calling it executes none of its body -- admission
+    control and prompt validation would not run until the first event was pulled, by
+    which point the status line is already sent and a rejected request has no way to
+    become a 503. Pulling the first event here costs one prefill of latency and buys
+    correct status codes: 503 when saturated, 422 when the prompt cannot fit.
+
+    ``iterate_in_threadpool`` then keeps the remaining blocking torch work off the event
+    loop; without it a single long generation stalls every other connection, health
+    probes included.
     """
+    events = engine.stream(request)
     try:
-        raw = await run_in_threadpool(lambda: engine.stream(request))
+        first = await run_in_threadpool(lambda: next(events, None))
     except EngineBusy as exc:
         record_failure("generate_stream", "busy")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        record_failure("generate_stream", "bad_request")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        record_failure("generate_stream", "error")
+        logger.exception("streaming generation failed to start")
+        raise HTTPException(status_code=500, detail="generation failed") from exc
+
+    def observe(event: dict) -> None:
+        if event.get("done"):
+            usage = event["usage"]
+            record_success(
+                "generate_stream",
+                event["latency_ms"],
+                event["ttft_ms"],
+                usage["prompt_tokens"],
+                usage["completion_tokens"],
+            )
+
+    def encode(event: dict) -> bytes:
+        return f"data: {json.dumps(event)}\n\n".encode()
 
     async def event_source() -> AsyncIterator[bytes]:
         IN_FLIGHT.inc()
         try:
-            async for event in iterate_in_threadpool(raw):
-                if event.get("done"):
-                    usage = event["usage"]
-                    record_success(
-                        "generate_stream",
-                        event["latency_ms"],
-                        event["ttft_ms"],
-                        usage["prompt_tokens"],
-                        usage["completion_tokens"],
-                    )
-                yield f"data: {json.dumps(event)}\n\n".encode()
+            if first is not None:
+                observe(first)
+                yield encode(first)
+                async for event in iterate_in_threadpool(events):
+                    observe(event)
+                    yield encode(event)
             yield b"data: [DONE]\n\n"
-        except EngineBusy as exc:
-            record_failure("generate_stream", "busy")
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n".encode()
         except Exception as exc:  # pragma: no cover - defensive
+            # The status line is already sent, so a mid-stream failure can only be
+            # reported inside the stream.
             record_failure("generate_stream", "error")
             logger.exception("streaming generation failed")
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n".encode()
+            yield encode({"error": str(exc)})
         finally:
+            # Closing the generator runs its `finally`, which releases the concurrency
+            # slot. Without this, a client that disconnects mid-stream leaks a slot
+            # until the generator happens to be garbage collected.
+            events.close()
             IN_FLIGHT.dec()
 
     return StreamingResponse(
