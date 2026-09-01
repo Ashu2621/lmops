@@ -127,6 +127,14 @@ TorchScript reproduces eager output bit-for-bit. ONNX does not, and is not expec
 onnxruntime is free to fuse and reassociate floating-point operations, so the tolerance
 is looser by design rather than by concession.
 
+**Which ONNX exporter ran matters.** PyTorch ships two and changed the default between
+releases, so `export_onnx` tries them in order and prints the winner. Verified on both
+torch 2.8.0 and torch 2.14.0 (the version CI installs), the TorchScript exporter is
+selected and passes parity at 1.907e-05 and 4.768e-07 respectively; the dynamo exporter
+is the fallback for when the deprecated path is finally removed. On torch 2.8 the
+dynamo exporter fails to decompose this graph outright, which is why the order is not
+reversed.
+
 ---
 
 ## 4. Inference latency
