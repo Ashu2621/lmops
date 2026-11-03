@@ -19,9 +19,11 @@ Three things here are worth more than the line count suggests:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import threading
 import time
+import urllib.request
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +66,35 @@ class IncrementalDecoder:
         text = self._buffer.decode("utf-8", errors="replace")
         self._buffer = b""
         return text
+
+
+def fetch_artifact(path: str, env: str) -> None:
+    """Download ``path`` from ``<env>_URL`` if it is missing, checking ``<env>_SHA256``.
+
+    For hosts with no volume to mount a model into (a free PaaS tier): the image
+    stays model-free, as CI asserts, and the deployment names a release asset to
+    fetch at start-up instead. The checksum is required, because the file is
+    about to be deserialised; a URL alone does not say the bytes are the ones
+    that were tested.
+    """
+    url = os.environ.get(f"{env}_URL")
+    target = Path(path)
+    if not url or target.exists():
+        return
+    expected = os.environ.get(f"{env}_SHA256", "").lower()
+    if not expected:
+        raise ValueError(f"{env}_URL is set but {env}_SHA256 is not")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".part")
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=60) as response, partial.open("wb") as out:
+        while chunk := response.read(1 << 20):
+            digest.update(chunk)
+            out.write(chunk)
+    if digest.hexdigest() != expected:
+        partial.unlink()
+        raise ValueError(f"{url} does not match {env}_SHA256")
+    partial.replace(target)
 
 
 @dataclass
@@ -132,9 +163,13 @@ class GenerationEngine:
     @classmethod
     def from_env(cls) -> GenerationEngine:
         """Build an engine from ``LMOPS_*`` environment variables (the container path)."""
+        checkpoint = os.environ.get("LMOPS_CHECKPOINT", "runs/default/best.pt")
+        tokenizer = os.environ.get("LMOPS_TOKENIZER", "data/processed/tokenizer.json")
+        fetch_artifact(checkpoint, "LMOPS_CHECKPOINT")
+        fetch_artifact(tokenizer, "LMOPS_TOKENIZER")
         return cls(
-            checkpoint=os.environ.get("LMOPS_CHECKPOINT", "runs/default/best.pt"),
-            tokenizer_path=os.environ.get("LMOPS_TOKENIZER", "data/processed/tokenizer.json"),
+            checkpoint=checkpoint,
+            tokenizer_path=tokenizer,
             device=os.environ.get("LMOPS_DEVICE", "auto"),
             max_concurrency=int(os.environ.get("LMOPS_MAX_CONCURRENCY", "4")),
             queue_timeout_s=float(os.environ.get("LMOPS_QUEUE_TIMEOUT_S", "10")),

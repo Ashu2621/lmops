@@ -279,3 +279,40 @@ def test_streaming_releases_its_slot(client: TestClient, engine: GenerationEngin
     assert engine.scheduler is not None
     assert engine.scheduler.active == 0, "a streaming request leaked a batch slot"
     assert len(engine.scheduler._free) == engine.max_concurrency
+
+
+# -- fetching the model at start-up ------------------------------------------
+
+
+def test_artifacts_are_fetched_only_with_a_matching_checksum(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host with no volume names a release asset to download. The bytes are about
+    to be deserialised, so a URL without a checksum, or a checksum that does not
+    match, must fail before anything is written where the engine will load it."""
+    import hashlib
+
+    from lmops.serving.engine import fetch_artifact
+
+    source = tmp_path / "published.bin"
+    source.write_bytes(b"model bytes")
+    good = hashlib.sha256(b"model bytes").hexdigest()
+    target = tmp_path / "models" / "best.pt"
+    monkeypatch.setenv("LMOPS_CHECKPOINT_URL", source.as_uri())
+
+    monkeypatch.delenv("LMOPS_CHECKPOINT_SHA256", raising=False)
+    with pytest.raises(ValueError, match="SHA256 is not"):
+        fetch_artifact(str(target), "LMOPS_CHECKPOINT")
+
+    monkeypatch.setenv("LMOPS_CHECKPOINT_SHA256", "0" * 64)
+    with pytest.raises(ValueError, match="does not match"):
+        fetch_artifact(str(target), "LMOPS_CHECKPOINT")
+    assert not target.exists() and not list(target.parent.glob("*.part"))
+
+    monkeypatch.setenv("LMOPS_CHECKPOINT_SHA256", good)
+    fetch_artifact(str(target), "LMOPS_CHECKPOINT")
+    assert target.read_bytes() == b"model bytes"
+
+    source.write_bytes(b"changed upstream")
+    fetch_artifact(str(target), "LMOPS_CHECKPOINT")
+    assert target.read_bytes() == b"model bytes", "an existing file is never re-fetched"
