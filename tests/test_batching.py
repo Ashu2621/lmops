@@ -156,10 +156,24 @@ def test_streaming_through_the_scheduler_matches_the_plain_response(
         engine.close()
 
 
+def _slow_decode(engine: GenerationEngine, seconds: float = 0.005) -> None:
+    """Make each decode step take a known minimum time. The admission tests need
+    a request to still be running when the next one arrives; on a fast machine an
+    80-token generation of the tiny test model can finish before that."""
+    real = engine.model.decode_step
+
+    def slow(*args, **kwargs):
+        time.sleep(seconds)
+        return real(*args, **kwargs)
+
+    engine.model.decode_step = slow  # type: ignore[method-assign]
+
+
 def test_a_full_queue_is_rejected_immediately(served_checkpoint: tuple[Path, Path]) -> None:
     """One slot busy, one request queued: the next is a fast EngineBusy (503), not a
     third place in an ever-growing line."""
     engine = _engine(served_checkpoint, max_concurrency=1, max_queue=1, queue_timeout_s=30)
+    _slow_decode(engine)
     long = GenerateRequest(prompt="x", max_new_tokens=80, temperature=0.0)
     try:
         with ThreadPoolExecutor(2) as pool:
@@ -180,15 +194,22 @@ def test_a_full_queue_is_rejected_immediately(served_checkpoint: tuple[Path, Pat
 def test_a_request_that_waits_past_its_timeout_is_rejected(
     served_checkpoint: tuple[Path, Path],
 ) -> None:
+    """The timeout holds while the batch stays full. It used to be checked only when
+    a slot freed up, so a waiting client could wait for the whole of someone else's
+    generation; a fast CI runner exposed it as a flaky pass."""
     engine = _engine(served_checkpoint, max_concurrency=1, max_queue=4, queue_timeout_s=0.05)
+    _slow_decode(engine)  # ~0.4 s for 80 tokens, far past the 0.05 s timeout
     try:
         with ThreadPoolExecutor(1) as pool:
             running = pool.submit(
                 engine.generate, GenerateRequest(prompt="x", max_new_tokens=80, temperature=0.0)
             )
             _wait_for(lambda: engine.scheduler.active == 1)
+            started = time.perf_counter()
             with pytest.raises(EngineBusy, match="waited"):
                 engine.generate(GenerateRequest(prompt="y", max_new_tokens=2))
+            assert time.perf_counter() - started < 0.3, "rejected only after the slot freed"
+            assert not running.done()
             running.result()
     finally:
         engine.close()
@@ -198,6 +219,7 @@ def test_a_client_that_goes_away_frees_its_slot(served_checkpoint: tuple[Path, P
     """Closing a stream mid-generation (what the HTTP layer does on disconnect) must
     retire the sequence at the next step, not keep generating to max_new_tokens."""
     engine = _engine(served_checkpoint, max_concurrency=2)
+    _slow_decode(engine)
     try:
         events = engine.stream(GenerateRequest(prompt="The", max_new_tokens=80, temperature=0.0))
         next(events)

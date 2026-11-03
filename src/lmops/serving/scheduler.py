@@ -137,6 +137,7 @@ class BatchScheduler:
                         self._cv.wait()
                     if self._stop:
                         break
+                    self._expire_waiting()
                     admitted = self._take_admissible()
                 for job in admitted:
                     self._prefill(job)
@@ -146,12 +147,13 @@ class BatchScheduler:
         for job in [*self._active.values(), *self._waiting]:
             job.out.put(EngineBusy("server is shutting down"))
 
-    def _take_admissible(self) -> list[Job]:
-        """Pop waiting jobs into free slots. Called with the lock held."""
+    def _expire_waiting(self) -> None:
+        """Reject waiting jobs past their deadline. Called with the lock held, every
+        step: checking only when a slot frees up let a client wait well past its
+        timeout whenever the batch stayed full."""
         now = time.monotonic()
-        admitted = []
-        while self._waiting and self._free:
-            job = self._waiting.popleft()
+        keep: collections.deque[Job] = collections.deque()
+        for job in self._waiting:
             if job.cancelled.is_set():
                 continue
             if now > job.deadline:
@@ -161,6 +163,16 @@ class BatchScheduler:
                         f"{self.max_batch} batch slots"
                     )
                 )
+                continue
+            keep.append(job)
+        self._waiting = keep
+
+    def _take_admissible(self) -> list[Job]:
+        """Pop waiting jobs into free slots. Called with the lock held."""
+        admitted = []
+        while self._waiting and self._free:
+            job = self._waiting.popleft()
+            if job.cancelled.is_set():
                 continue
             self._free.sort()
             job.slot = self._free.pop(0)
