@@ -49,7 +49,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as an unprivileged user: a model server has no reason to be root.
-RUN useradd --create-home --uid 10001 lmops \n    && mkdir /models && chown lmops /models
+RUN useradd --create-home --uid 10001 lmops \
+    && mkdir /models && chown lmops /models
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
