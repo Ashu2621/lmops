@@ -1,6 +1,13 @@
 """Model definition: layers, attention with KV cache, and the transformer LM."""
 
-from .attention import CausalSelfAttention, KVCache, build_cache_mask, repeat_kv
+from .attention import (
+    CausalSelfAttention,
+    KVCache,
+    SlotKVCache,
+    SlotStep,
+    build_cache_mask,
+    repeat_kv,
+)
 from .layers import RMSNorm, RotaryEmbedding, SwiGLU, apply_rotary
 from .transformer import LanguageModel, TransformerBlock
 
@@ -10,6 +17,8 @@ __all__ = [
     "LanguageModel",
     "RMSNorm",
     "RotaryEmbedding",
+    "SlotKVCache",
+    "SlotStep",
     "SwiGLU",
     "TransformerBlock",
     "apply_rotary",

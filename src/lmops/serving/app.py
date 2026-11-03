@@ -69,6 +69,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # "not ready" instead of a crash-loop with no diagnostics.
             logger.error("failed to load model at start-up: %s", exc)
     yield
+    if _engine is not None:
+        _engine.close()
     set_engine(None)
 
 

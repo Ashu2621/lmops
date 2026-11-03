@@ -47,8 +47,12 @@ spec:
               value: /models/tokenizer.json
             - name: LMOPS_DEVICE
               value: cpu
+            # Batch size: this many requests decode together; up to LMOPS_MAX_QUEUE
+            # more wait for a slot before new ones get a 503.
             - name: LMOPS_MAX_CONCURRENCY
               value: "4"
+            - name: LMOPS_MAX_QUEUE
+              value: "16"
             # Keep torch's thread pool inside the CPU limit. Left unset, torch sizes
             # it from the node's core count and thrashes against the cgroup quota.
             - name: OMP_NUM_THREADS

@@ -5,9 +5,12 @@ Three things here are worth more than the line count suggests:
 *   **Incremental UTF-8 decoding.** A byte-level BPE token can end halfway through a
     multi-byte character. Decoding each token independently produces mojibake in the
     stream, so bytes are buffered until they form complete characters.
-*   **Admission control.** Generation is CPU/GPU-bound and blocking. A bounded
-    semaphore turns overload into a fast ``503`` instead of an unbounded queue where
-    every request times out and the client retries into the same wall.
+*   **Continuous batching.** By default every in-flight request is decoded in the
+    same forward pass (``scheduler.py``), so concurrent requests share the cost of
+    reading the weights instead of queueing behind each other.
+*   **Admission control.** Overload is a fast ``503``, not an unbounded queue where
+    every request times out and the client retries into the same wall: a bounded
+    waiting queue with a timeout when batching, a bounded semaphore when not.
 *   **Thread offload.** Torch releases the GIL inside its kernels, so running
     generation in a worker thread keeps the event loop free to serve ``/healthz``
     while the model is busy.
@@ -15,10 +18,11 @@ Three things here are worth more than the line count suggests:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,11 +32,8 @@ from ..data import ByteBPETokenizer
 from ..model import LanguageModel
 from ..training.checkpoint import build_model_from_checkpoint
 from ..training.trainer import resolve_device
+from .scheduler import BatchScheduler, EngineBusy
 from .schemas import GenerateRequest, GenerateResponse, Usage
-
-
-class EngineBusy(RuntimeError):
-    """Raised when admission control rejects a request."""
 
 
 class IncrementalDecoder:
@@ -88,6 +89,8 @@ class GenerationEngine:
         max_concurrency: int = 4,
         queue_timeout_s: float = 10.0,
         torch_threads: int | None = None,
+        batching: bool = True,
+        max_queue: int = 32,
     ) -> None:
         if torch_threads:
             torch.set_num_threads(torch_threads)
@@ -106,6 +109,14 @@ class GenerationEngine:
                 f"checkpoint's vocab_size={self.model.config.vocab_size}; these artifacts "
                 "come from different runs"
             )
+
+        # With batching, max_concurrency is the batch size: that many requests decode
+        # together and the rest wait (up to max_queue of them) for a free slot.
+        self.scheduler = (
+            BatchScheduler(self.model, max_concurrency, max_queue, queue_timeout_s)
+            if batching
+            else None
+        )
 
         self.info = EngineInfo(
             checkpoint=str(checkpoint),
@@ -130,7 +141,13 @@ class GenerationEngine:
             torch_threads=int(os.environ["LMOPS_TORCH_THREADS"])
             if os.environ.get("LMOPS_TORCH_THREADS")
             else None,
+            batching=os.environ.get("LMOPS_BATCHING", "1") not in ("0", "false", "off"),
+            max_queue=int(os.environ.get("LMOPS_MAX_QUEUE", "32")),
         )
+
+    def close(self) -> None:
+        if self.scheduler is not None:
+            self.scheduler.close()
 
     # -- internals ------------------------------------------------------------
 
@@ -158,34 +175,65 @@ class GenerationEngine:
                 f"all {self.max_concurrency} generation slots busy for {self.queue_timeout_s:.0f}s"
             )
 
+    @contextlib.contextmanager
+    def _admitted(self) -> Iterator[None]:
+        """The semaphore is the admission control only without batching; the
+        scheduler does its own (queue bound and queue timeout)."""
+        if self.scheduler is not None:
+            yield
+            return
+        self._acquire()
+        try:
+            yield
+        finally:
+            self._slots.release()
+
+    def _token_ids(self, request: GenerateRequest, ids: list[int]) -> Iterator[int]:
+        generator = self._generator(request.seed)
+        if self.scheduler is not None:
+            job = self.scheduler.submit(
+                {
+                    "ids": ids,
+                    "max_new_tokens": request.max_new_tokens,
+                    "temperature": request.temperature,
+                    "top_k": request.top_k or None,
+                    "top_p": request.top_p,
+                    "repetition_penalty": request.repetition_penalty,
+                    "generator": generator,
+                }
+            )
+            yield from job.tokens()
+            return
+        idx = torch.tensor([ids], dtype=torch.long, device=self.device)
+        for token in self.model.stream(
+            idx,
+            request.max_new_tokens,
+            temperature=request.temperature,
+            top_k=request.top_k or None,
+            top_p=request.top_p,
+            repetition_penalty=request.repetition_penalty,
+            generator=generator,
+        ):
+            yield int(token[0, 0].item())
+
     # -- public API -----------------------------------------------------------
 
     def generate(self, request: GenerateRequest) -> GenerateResponse:
         """Run a blocking, non-streaming generation."""
-        self._acquire()
-        try:
+        with self._admitted():
             start = time.perf_counter()
             ids = self._encode_prompt(request.prompt, request.max_new_tokens)
-            idx = torch.tensor([ids], dtype=torch.long, device=self.device)
 
             decoder = IncrementalDecoder(self.tokenizer)
             pieces: list[str] = []
             ttft = 0.0
             produced = 0
 
-            for token in self.model.stream(
-                idx,
-                request.max_new_tokens,
-                temperature=request.temperature,
-                top_k=request.top_k or None,
-                top_p=request.top_p,
-                repetition_penalty=request.repetition_penalty,
-                generator=self._generator(request.seed),
-            ):
+            for token in self._token_ids(request, ids):
                 if produced == 0:
                     ttft = (time.perf_counter() - start) * 1000.0
                 produced += 1
-                pieces.append(decoder.push(int(token[0, 0].item())))
+                pieces.append(decoder.push(token))
             pieces.append(decoder.flush())
 
             completion = "".join(pieces)
@@ -203,34 +251,22 @@ class GenerationEngine:
                 model=Path(self.info.checkpoint).name,
                 seed=request.seed,
             )
-        finally:
-            self._slots.release()
 
     def stream(self, request: GenerateRequest) -> Generator[dict, None, None]:
         """Yield ``{"delta": ...}`` events, then a final ``{"done": true, ...}`` event."""
-        self._acquire()
-        try:
+        with self._admitted():
             start = time.perf_counter()
             ids = self._encode_prompt(request.prompt, request.max_new_tokens)
-            idx = torch.tensor([ids], dtype=torch.long, device=self.device)
 
             decoder = IncrementalDecoder(self.tokenizer)
             produced = 0
             ttft = 0.0
 
-            for token in self.model.stream(
-                idx,
-                request.max_new_tokens,
-                temperature=request.temperature,
-                top_k=request.top_k or None,
-                top_p=request.top_p,
-                repetition_penalty=request.repetition_penalty,
-                generator=self._generator(request.seed),
-            ):
+            for token in self._token_ids(request, ids):
                 if produced == 0:
                     ttft = (time.perf_counter() - start) * 1000.0
                 produced += 1
-                delta = decoder.push(int(token[0, 0].item()))
+                delta = decoder.push(token)
                 if delta:
                     yield {"delta": delta}
 
@@ -248,8 +284,6 @@ class GenerationEngine:
                 "latency_ms": round((time.perf_counter() - start) * 1000.0, 2),
                 "ttft_ms": round(ttft, 2),
             }
-        finally:
-            self._slots.release()
 
 
 __all__ = ["EngineBusy", "EngineInfo", "GenerationEngine", "IncrementalDecoder", "LanguageModel"]

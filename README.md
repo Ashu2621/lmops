@@ -130,6 +130,25 @@ uncached latency grows with it (13.30 ms → 20.02 ms). The cache is also margin
 *slower* to first token, because prefill does the same work either way plus the cache
 writes — a single "N× faster" headline would hide both facts.
 
+### Continuous batching, measured
+
+32 requests (32-token prompts, 64 new tokens, greedy) with N allowed in flight.
+*Per-request* is the old server: each request runs its own decode loop in its own
+thread. *Batched* decodes every in-flight request in one forward pass
+([`scripts/bench_batching.py`](scripts/bench_batching.py), median of 3 runs):
+
+| in flight | per-request tok/s | batched tok/s | speed-up | per-request p50 | batched p50 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 221 | 206 | 0.93× | 275 ms | 305 ms |
+| 4 | 184 | 557 | **3.0×** | 1,388 ms | 428 ms |
+| 8 | 167 | 895 | **5.4×** | 3,067 ms | 533 ms |
+| 16 | 162 | 1,119 | **6.9×** | 6,249 ms | 904 ms |
+
+Per-request throughput does not grow with concurrency, because each request repeats
+the full weight read and the threads only contend for the same cores. Batched
+throughput grows with the batch, and latency under load falls from 6.2 s to 0.9 s at
+16 in flight. With one request the scheduler is about 7% slower than the direct path.
+
 ---
 
 ## Architecture
@@ -216,7 +235,7 @@ def test_kv_cache_matches_full_forward(tiny_model):
 
 ## Testing
 
-**139 tests.** Correctness properties, not coverage theatre. A selection of what is
+**149 tests.** Correctness properties, not coverage theatre. A selection of what is
 actually asserted:
 
 | Test | What breaks without it |
@@ -235,6 +254,9 @@ actually asserted:
 | `test_incremental_decoder_reassembles_split_characters` | Broken emoji/CJK in the token stream |
 | `test_healthz_does_not_depend_on_the_model` | An orchestrator killing pods that are merely busy |
 | `test_slots_are_released_after_a_failure` | A semaphore leak that wedges the server after N errors |
+| `test_slot_decode_matches_full_forward_for_rows_at_different_lengths` | A batch that leaks one row's keys into another, or rotates a row at the wrong position |
+| `test_batched_output_equals_one_at_a_time_output` | Batching changing what a request returns, seeded sampling included |
+| `test_a_client_that_goes_away_frees_its_slot` | A disconnected client generating to `max_new_tokens` and holding a batch slot |
 | `test_unknown_keys_are_rejected_not_ignored` | A typo'd config key silently training the wrong model |
 
 Two tests deserve a note because they document *behaviour*, not just guard it:
@@ -278,11 +300,19 @@ curl -X POST http://127.0.0.1:8000/v1/generate \
 
 Operational behaviour worth noting:
 
+- **Continuous batching.** Every request in flight is decoded in the same forward
+  pass. A new request is prefilled into a free slot of a per-slot KV cache and joins
+  the running batch at the next step, instead of waiting for the others to finish.
+  Each request keeps its own sampling settings and seeded generator, so batching never
+  changes what a request returns (`test_batched_output_equals_one_at_a_time_output`).
+  `LMOPS_MAX_CONCURRENCY` is the batch size; `LMOPS_BATCHING=0` restores the old
+  one-request-per-thread path.
 - **Liveness ≠ readiness.** Wiring both to one handler means a saturated server gets
   killed by its own orchestrator mid-request.
-- **Admission control** is a bounded semaphore with a timeout, so overload is a fast
-  `503` rather than an unbounded queue where everything times out and every client
-  retries into the same wall.
+- **Admission control** is a bounded waiting queue (`LMOPS_MAX_QUEUE`) with a
+  timeout, so overload is a fast `503` rather than an unbounded queue where everything
+  times out and every client retries into the same wall. A client that disconnects
+  mid-stream frees its slot at the next step.
 - **`422` vs `500`.** A request the model cannot satisfy (empty prompt, `max_new_tokens`
   larger than the context) is a client error and is reported as one.
 - **Blocking work runs in a thread pool**, so the event loop still answers health
@@ -294,6 +324,9 @@ Operational behaviour worth noting:
 `lmops_requests_total{endpoint,status}` · `lmops_request_latency_seconds` ·
 `lmops_ttft_seconds` · `lmops_tokens_generated_total` · `lmops_tokens_prompt_total` ·
 `lmops_requests_in_flight` · `lmops_requests_rejected_total` · `lmops_model_info`
+
+`lmops_batch_size` (sequences per decode step) and `lmops_queue_depth` show whether
+the batch is actually filling and whether requests are waiting for a slot.
 
 Time-to-first-token and total latency are separate histograms because a generation SLO
 is written against both, and their buckets are sized for this workload rather than
@@ -361,6 +394,7 @@ src/lmops/
 ├── export/graph.py      TorchScript + ONNX + parity checks + int8 quantisation
 └── serving/
     ├── engine.py        incremental UTF-8 decode, admission control
+    ├── scheduler.py     continuous batching over a per-slot KV cache
     ├── app.py           FastAPI routes, SSE, health, metrics
     ├── schemas.py       request/response validation
     └── observability.py Prometheus collectors
@@ -373,8 +407,11 @@ src/lmops/
 Stated because the boundary is more useful than pretending there isn't one:
 
 - **Single-process training.** No DDP/FSDP. Untested distributed code is worse than none.
-- **No continuous batching.** Requests are served one per slot. Real throughput serving
-  needs a paged KV cache and a scheduler that admits sequences into a running batch.
+- **Batching is per-slot, not paged.** Each slot reserves a full context of KV cache,
+  and prefill runs one request at a time. Paged KV blocks and batched or chunked
+  prefill are what a GPU-scale server adds next; at this model size the slot cache
+  costs about 1.6 MB per slot. With one request in flight the scheduler costs about 7%
+  throughput against the direct path, from its per-step bookkeeping.
 - **Export covers scoring only.** Cached decode is not exported; the reason is in
   [`docs/architecture.md`](docs/architecture.md#7-export).
 - **Base model only.** No instruction tuning, no alignment.

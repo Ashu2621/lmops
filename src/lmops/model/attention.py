@@ -79,6 +79,107 @@ class KVCache:
         self.pos = 0
 
 
+@dataclass
+class SlotKVCache:
+    """A cache with one row ("slot") per in-flight sequence, each at its own length.
+
+    :class:`KVCache` advances every row together, which is right for one request but
+    means a batch can only be formed from requests that started at the same moment
+    with prompts of the same length. Here each slot keeps its own length, so the
+    serving scheduler can prefill a newcomer into a free slot and decode it in the
+    same step as sequences that are already hundreds of tokens in. Rows past a slot's
+    length hold stale keys from its previous occupant; the decode mask hides them.
+    """
+
+    keys: list[Tensor]
+    values: list[Tensor]
+    lengths: Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        config: ModelConfig,
+        n_slots: int,
+        max_seq_len: int | None = None,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> SlotKVCache:
+        assert config.n_kv_head is not None
+        length = max_seq_len or config.max_seq_len
+        shape = (n_slots, config.n_kv_head, length, config.head_dim)
+        keys = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(config.n_layer)]
+        values = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(config.n_layer)]
+        lengths = torch.zeros(n_slots, dtype=torch.long, device=device)
+        return cls(keys=keys, values=values, lengths=lengths)
+
+    @property
+    def capacity(self) -> int:
+        return self.keys[0].shape[2]
+
+    def load(self, slot: int, prefilled: KVCache) -> None:
+        """Copy a single-sequence prefill into ``slot``."""
+        n = prefilled.pos
+        if n > self.capacity:
+            raise ValueError(f"prefill of {n} tokens does not fit a {self.capacity}-slot cache")
+        for layer in range(len(self.keys)):
+            self.keys[layer][slot, :, :n] = prefilled.keys[layer][0, :, :n]
+            self.values[layer][slot, :, :n] = prefilled.values[layer][0, :, :n]
+        self.lengths[slot] = n
+
+
+@dataclass
+class SlotStep:
+    """One decode step over a subset of slots: one new token per selected slot."""
+
+    cache: SlotKVCache
+    slots: Tensor
+
+    def __post_init__(self) -> None:
+        self.positions = self.cache.lengths[self.slots]
+        longest = int(self.positions.max())
+        if longest >= self.cache.capacity:
+            raise ValueError("KV cache overflow: a slot is already at capacity")
+        # Attend over the keys the longest selected row has, not the whole capacity.
+        # Without the trim a single 40-token request paid for all 192 positions every
+        # step, and batching was slower than no batching for one user.
+        self.kv_len = longest + 1
+        # Selected slots that form a contiguous run can be read as a view; anything
+        # else needs a gather, which copies every row's keys on every layer.
+        first = int(self.slots[0])
+        contiguous = bool(
+            torch.equal(
+                self.slots, torch.arange(first, first + len(self.slots), device=self.slots.device)
+            )
+        )
+        self._rows = slice(first, first + len(self.slots)) if contiguous else self.slots
+
+    def update(self, layer_idx: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Write each row's key at its own position; return each row's history."""
+        # Advanced indices on dims 0 and 2 split by a slice put the index dim first,
+        # so both sides are (n_selected, n_kv_head, head_dim).
+        self.cache.keys[layer_idx][self.slots, :, self.positions] = k[:, :, 0]
+        self.cache.values[layer_idx][self.slots, :, self.positions] = v[:, :, 0]
+        n = self.kv_len
+        return (
+            self.cache.keys[layer_idx][self._rows, :, :n],
+            self.cache.values[layer_idx][self._rows, :, :n],
+        )
+
+    def mask(self) -> Tensor | None:
+        """Keep-mask ``(n, 1, 1, kv_len)``: each row sees keys up to its own position.
+
+        ``None`` for a single row: ``kv_len`` already stops at its last key, so every
+        key is visible and SDPA can take its unmasked path.
+        """
+        if len(self.slots) == 1:
+            return None
+        keys = torch.arange(self.kv_len, device=self.slots.device)
+        return (keys[None, :] <= self.positions[:, None])[:, None, None, :]
+
+    def advance(self) -> None:
+        self.cache.lengths[self.slots] += 1
+
+
 def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
     """Expand ``(B, n_kv_head, S, D)`` to ``(B, n_kv_head * n_rep, S, D)`` for GQA."""
     if n_rep == 1:
@@ -126,7 +227,7 @@ class CausalSelfAttention(nn.Module):
         x: Tensor,
         cos: Tensor,
         sin: Tensor,
-        cache: KVCache | None = None,
+        cache: KVCache | SlotStep | None = None,
         attn_mask: Tensor | None = None,
     ) -> Tensor:
         batch, seq_len, _ = x.shape

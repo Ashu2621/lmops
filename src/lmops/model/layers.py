@@ -90,9 +90,15 @@ def apply_rotary(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
     ``cos``/``sin`` arrive as ``(seq, head_dim / 2)`` and are duplicated to the full
     head width so the halved-rotation form above lines up with the interleaved pairs.
+    A ``(batch, seq, head_dim / 2)`` table gives every row its own positions, which is
+    what a batch of sequences at different lengths needs.
     """
-    cos = torch.cat((cos, cos), dim=-1)[None, None, :, :].to(x.dtype)
-    sin = torch.cat((sin, sin), dim=-1)[None, None, :, :].to(x.dtype)
+    cos = torch.cat((cos, cos), dim=-1).to(x.dtype)
+    sin = torch.cat((sin, sin), dim=-1).to(x.dtype)
+    if cos.dim() == 3:
+        cos, sin = cos[:, None, :, :], sin[:, None, :, :]
+    else:
+        cos, sin = cos[None, None, :, :], sin[None, None, :, :]
     return x * cos + _rotate_half(x) * sin
 
 
