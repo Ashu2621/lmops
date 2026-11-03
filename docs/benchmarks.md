@@ -209,3 +209,32 @@ constrains that further at some cost in speed.
   starting point, but every figure above is CPU-only.
 - **Quantised inference.** `quantize_dynamic_int8` is implemented and tested for
   shape and top-1 agreement, but no end-to-end latency/quality trade-off was measured.
+
+---
+
+## Continuous batching
+
+```bash
+python scripts/bench_batching.py --config configs/small.yaml --requests 32 --new 64 --concurrency 1,4,8,16
+```
+
+`configs/small.yaml` architecture with untrained weights (throughput does not depend
+on what the weights are), 32 requests, 32-token prompts, 64 new tokens each, greedy.
+*Per-request* runs each in-flight request in its own thread with its own decode loop,
+which is what the server did before batching. *Batched* runs them through the
+scheduler. Median of 3 runs on an 8-thread laptop CPU, Windows 11, PyTorch
+2.15.0+cpu, `torch.get_num_threads() == 4`; a different machine from the training
+numbers above.
+
+| in flight | per-request tok/s | batched tok/s | speed-up | per-request p50 | batched p50 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 221 | 206 | 0.93× | 275 ms | 305 ms |
+| 4 | 184 | 557 | **3.0×** | 1,388 ms | 428 ms |
+| 8 | 167 | 895 | **5.4×** | 3,067 ms | 533 ms |
+| 16 | 162 | 1,119 | **6.9×** | 6,249 ms | 904 ms |
+
+Two changes were needed before the single-request row stopped being a regression.
+The first version attended over the full 192-position cache every step; trimming the
+key axis to the longest active sequence fixed most of it. The rest came from reading
+contiguous slots as a view instead of gathering them, and passing no mask for a single
+row. The remaining ~7% is per-step bookkeeping in the scheduler thread.

@@ -189,8 +189,10 @@ Being explicit about the boundary is more useful than pretending there isn't one
 
 - **Distributed training.** The loop is single-process. DDP would be a wrapper plus a
   sampler change, but untested distributed code is worse than none.
-- **Continuous batching.** Requests are served one at a time per slot. Real throughput
-  serving needs a paged KV cache and a scheduler that admits new sequences into a
-  running batch — a different project.
+- **Paged KV cache and batched prefill.** Continuous batching is implemented
+  (`serving/scheduler.py`, per-slot cache in `model/attention.py`), but each slot
+  reserves a full context of cache and prefill runs one request at a time. Paging the
+  cache into blocks and prefilling several requests in one pass is what a GPU-scale
+  server adds next.
 - **Instruction tuning / RLHF.** This is a base language model.
 - **A learned tokenizer beyond BPE.** No unigram or WordPiece implementation.
