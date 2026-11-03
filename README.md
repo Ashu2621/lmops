@@ -15,6 +15,12 @@ export with numerical parity checks, a production-shaped inference server, Prome
 instrumentation, container and Kubernetes manifests, and CI that runs the whole
 pipeline end to end on every push.
 
+**Live API:** https://lmops-rc2c.onrender.com/docs serves the reference model
+(release [`model-small-v1`](https://github.com/Ashu2621/lmops/releases/tag/model-small-v1),
+fetched at start-up and checked against its SHA-256) with continuous batching. Try
+`POST /v1/generate` with `{"prompt": "KING RICHARD:", "seed": 7}`. Free tier: 0.1 CPU,
+so it is slow, and the first request after 15 idle minutes takes about a minute.
+
 ---
 
 ## Why this exists
