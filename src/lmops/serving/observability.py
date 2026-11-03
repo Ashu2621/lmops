@@ -62,6 +62,19 @@ REJECTED = Counter(
     registry=REGISTRY,
 )
 
+BATCH_SIZE = Histogram(
+    "lmops_batch_size",
+    "Sequences decoded together in one continuous-batching step.",
+    buckets=(1, 2, 3, 4, 6, 8, 12, 16, 24, 32),
+    registry=REGISTRY,
+)
+
+QUEUE_DEPTH = Gauge(
+    "lmops_queue_depth",
+    "Requests admitted but waiting for a free batch slot.",
+    registry=REGISTRY,
+)
+
 MODEL_INFO = Info(
     "lmops_model",
     "Static description of the loaded checkpoint.",

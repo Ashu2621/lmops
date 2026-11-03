@@ -69,7 +69,15 @@ def test_seeded_requests_are_reproducible(engine: GenerationEngine) -> None:
     assert engine.generate(request).completion == engine.generate(request).completion
 
 
-def test_admission_control_rejects_when_saturated(engine: GenerationEngine) -> None:
+def test_admission_control_rejects_when_saturated(
+    served_checkpoint: tuple[Path, Path],
+) -> None:
+    """Without batching the semaphore is the admission control; batched admission
+    has its own tests in test_batching.py."""
+    checkpoint, tokenizer = served_checkpoint
+    engine = GenerationEngine(
+        checkpoint, tokenizer, device="cpu", max_concurrency=2, batching=False
+    )
     engine.queue_timeout_s = 0.05
     engine._slots.acquire()
     engine._slots.acquire()
@@ -246,16 +254,11 @@ def test_streaming_returns_503_when_saturated(client: TestClient, engine: Genera
     the first event is pulled. The route primes the generator before returning the
     response precisely so this status code is still changeable.
     """
-    engine.queue_timeout_s = 0.05
-    engine._slots.acquire()
-    engine._slots.acquire()
-    try:
-        response = client.post("/v1/generate/stream", json={"prompt": "hi", "max_new_tokens": 4})
-        assert response.status_code == 503
-        assert "busy" in response.json()["detail"]
-    finally:
-        engine._slots.release()
-        engine._slots.release()
+    assert engine.scheduler is not None
+    engine.scheduler.max_queue = 0  # no room to wait: the scheduler is saturated
+    response = client.post("/v1/generate/stream", json={"prompt": "hi", "max_new_tokens": 4})
+    assert response.status_code == 503
+    assert "busy" in response.json()["detail"]
 
 
 def test_streaming_returns_422_for_an_impossible_budget(client: TestClient) -> None:
@@ -273,10 +276,6 @@ def test_streaming_releases_its_slot(client: TestClient, engine: GenerationEngin
             assert response.status_code == 200
             response.read()
 
-    acquired = [engine._slots.acquire(blocking=False) for _ in range(engine.max_concurrency)]
-    try:
-        assert all(acquired), "a streaming request leaked a concurrency slot"
-    finally:
-        for ok in acquired:
-            if ok:
-                engine._slots.release()
+    assert engine.scheduler is not None
+    assert engine.scheduler.active == 0, "a streaming request leaked a batch slot"
+    assert len(engine.scheduler._free) == engine.max_concurrency
