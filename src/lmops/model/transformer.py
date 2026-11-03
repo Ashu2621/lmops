@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator
+from typing import cast
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..config import ModelConfig
-from .attention import CausalSelfAttention, KVCache, build_cache_mask
+from .attention import CausalSelfAttention, KVCache, SlotStep, build_cache_mask
 from .layers import RMSNorm, RotaryEmbedding, SwiGLU
 
 
@@ -30,7 +31,7 @@ class TransformerBlock(nn.Module):
         x: Tensor,
         cos: Tensor,
         sin: Tensor,
-        cache: KVCache | None = None,
+        cache: KVCache | SlotStep | None = None,
         attn_mask: Tensor | None = None,
     ) -> Tensor:
         x = x + self.attn(self.attn_norm(x), cos, sin, cache=cache, attn_mask=attn_mask)
@@ -135,6 +136,25 @@ class LanguageModel(nn.Module):
                 ignore_index=-100,
             )
         return logits, loss
+
+    def decode_step(self, tokens: Tensor, step: SlotStep) -> Tensor:
+        """One token for each selected slot, every slot at its own position.
+
+        ``tokens`` is ``(n, 1)``, one per slot in ``step.slots``. Returns ``(n, 1, vocab)``
+        logits. This is the continuous-batching path: the same weights multiply ``n``
+        rows at once, so a step costs little more than a single-sequence step.
+        """
+        rope_cos = cast(Tensor, self.rope.cos_cached).to(tokens.device)
+        rope_sin = cast(Tensor, self.rope.sin_cached).to(tokens.device)
+        cos = rope_cos[step.positions][:, None, :]
+        sin = rope_sin[step.positions][:, None, :]
+        mask = step.mask()
+
+        x = self.token_emb(tokens)
+        for block in self.blocks:
+            x = block(x, cos, sin, cache=step, attn_mask=mask)
+        step.advance()
+        return self.lm_head(self.final_norm(x))
 
     # -- generation -----------------------------------------------------------
 
