@@ -241,7 +241,7 @@ def test_kv_cache_matches_full_forward(tiny_model):
 
 ## Testing
 
-**149 tests.** Correctness properties, not coverage theatre. A selection of what is
+**150 tests.** Correctness properties, not coverage theatre. A selection of what is
 actually asserted:
 
 | Test | What breaks without it |
